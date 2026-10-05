@@ -1,5 +1,4 @@
 // Package blocklist 是玩家拉黑名单：名额上限、与好友互斥、请求幂等与 JSON 状态往返。
-// 缺陷：上限不生效、不查好友互斥、同一个 reqID 重复生效、Save 漏掉好友与已处理请求（往返丢数据）。
 package blocklist
 
 import (
@@ -40,8 +39,17 @@ func (l *List) AddFriend(a, b string) {
 	}
 }
 
-// Block 拉黑一个玩家。缺陷：不看名额上限、不查好友互斥、不查 reqID 是否处理过。
+// Block 拉黑一个玩家：reqID 幂等，好友互斥，名额受限，任一不满足则名单不变。
 func (l *List) Block(reqID, player, target string) error {
+	if l.seen[reqID] {
+		return ErrReplayed
+	}
+	if l.friends[player][target] {
+		return ErrFriend
+	}
+	if len(l.blocked[player]) >= l.max {
+		return ErrTooMany
+	}
 	l.blocked[player] = append(l.blocked[player], target)
 	l.seen[reqID] = true
 	return nil
@@ -66,17 +74,24 @@ func (l *List) Blocked(player string) []string {
 	return out
 }
 
-// Save 序列化台账。缺陷：只写拉黑名单，好友与已处理请求都丢了。
+// Save 序列化台账：名额上限、拉黑名单、好友关系与已处理请求全部落盘。
 func (l *List) Save() []byte {
-	body, _ := json.Marshal(map[string]any{"max": l.max, "blocked": l.blocked})
+	body, _ := json.Marshal(map[string]any{
+		"max":     l.max,
+		"blocked": l.blocked,
+		"friends": l.friends,
+		"seen":    l.seen,
+	})
 	return body
 }
 
 // Load 从 JSON 恢复台账。
 func (l *List) Load(data []byte) error {
 	payload := struct {
-		Max     int                 `json:"max"`
-		Blocked map[string][]string `json:"blocked"`
+		Max     int                        `json:"max"`
+		Blocked map[string][]string        `json:"blocked"`
+		Friends map[string]map[string]bool `json:"friends"`
+		Seen    map[string]bool            `json:"seen"`
 	}{}
 	if err := json.Unmarshal(data, &payload); err != nil {
 		return err
@@ -84,6 +99,12 @@ func (l *List) Load(data []byte) error {
 	l.max = payload.Max
 	if payload.Blocked != nil {
 		l.blocked = payload.Blocked
+	}
+	if payload.Friends != nil {
+		l.friends = payload.Friends
+	}
+	if payload.Seen != nil {
+		l.seen = payload.Seen
 	}
 	return nil
 }
