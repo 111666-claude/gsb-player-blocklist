@@ -1,5 +1,4 @@
 // Package blocklist 是玩家拉黑名单：名额上限、与好友互斥、请求幂等与 JSON 状态往返。
-// 缺陷：上限不生效、不查好友互斥、同一个 reqID 重复生效、Save 漏掉好友与已处理请求（往返丢数据）。
 package blocklist
 
 import (
@@ -40,8 +39,24 @@ func (l *List) AddFriend(a, b string) {
 	}
 }
 
-// Block 拉黑一个玩家。缺陷：不看名额上限、不查好友互斥、不查 reqID 是否处理过。
+// Block 拉黑一个玩家：reqID 重复返回 ErrReplayed；对方是好友返回 ErrFriend；
+// 超过名额上限返回 ErrTooMany。任何失败都不改变台账。
 func (l *List) Block(reqID, player, target string) error {
+	if l.seen[reqID] {
+		return ErrReplayed
+	}
+	if l.friends[player][target] {
+		return ErrFriend
+	}
+	for _, name := range l.blocked[player] {
+		if name == target {
+			l.seen[reqID] = true
+			return nil
+		}
+	}
+	if len(l.blocked[player]) >= l.max {
+		return ErrTooMany
+	}
 	l.blocked[player] = append(l.blocked[player], target)
 	l.seen[reqID] = true
 	return nil
@@ -66,24 +81,61 @@ func (l *List) Blocked(player string) []string {
 	return out
 }
 
-// Save 序列化台账。缺陷：只写拉黑名单，好友与已处理请求都丢了。
+// snapshot 是台账的 JSON 表示，名额上限、拉黑名单、好友关系与已处理请求全部落盘。
+type snapshot struct {
+	Max     int                 `json:"max"`
+	Blocked map[string][]string `json:"blocked"`
+	Friends map[string][]string `json:"friends"`
+	Seen    []string            `json:"seen"`
+}
+
+// Save 序列化台账。
 func (l *List) Save() []byte {
-	body, _ := json.Marshal(map[string]any{"max": l.max, "blocked": l.blocked})
+	friends := map[string][]string{}
+	for player, set := range l.friends {
+		names := make([]string, 0, len(set))
+		for name := range set {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		friends[player] = names
+	}
+	seen := make([]string, 0, len(l.seen))
+	for reqID := range l.seen {
+		seen = append(seen, reqID)
+	}
+	sort.Strings(seen)
+	body, _ := json.Marshal(snapshot{
+		Max:     l.max,
+		Blocked: l.blocked,
+		Friends: friends,
+		Seen:    seen,
+	})
 	return body
 }
 
 // Load 从 JSON 恢复台账。
 func (l *List) Load(data []byte) error {
-	payload := struct {
-		Max     int                 `json:"max"`
-		Blocked map[string][]string `json:"blocked"`
-	}{}
+	payload := snapshot{}
 	if err := json.Unmarshal(data, &payload); err != nil {
 		return err
 	}
 	l.max = payload.Max
+	l.blocked = map[string][]string{}
 	if payload.Blocked != nil {
 		l.blocked = payload.Blocked
+	}
+	l.friends = map[string]map[string]bool{}
+	for player, names := range payload.Friends {
+		set := map[string]bool{}
+		for _, name := range names {
+			set[name] = true
+		}
+		l.friends[player] = set
+	}
+	l.seen = map[string]bool{}
+	for _, reqID := range payload.Seen {
+		l.seen[reqID] = true
 	}
 	return nil
 }
